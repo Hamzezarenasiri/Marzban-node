@@ -10,9 +10,18 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH
+from config import (
+    XRAY_ASSETS_PATH,
+    XRAY_EXECUTABLE_PATH,
+    SINGBOX_ENABLED,
+    SINGBOX_EXECUTABLE_PATH,
+    SINGBOX_WORKING_DIR,
+)
 from logger import logger
 from xray import XRayConfig, XRayCore
+
+if SINGBOX_ENABLED:
+    from singbox import SingBoxConfig, SingBoxCore
 
 app = FastAPI()
 
@@ -42,6 +51,16 @@ class Service(object):
         self.core_version = self.core.get_version()
         self.config = None
 
+        # Initialize Sing-box if enabled
+        self.singbox_core = None
+        self.singbox_version = None
+        if SINGBOX_ENABLED:
+            self.singbox_core = SingBoxCore(
+                executable_path=SINGBOX_EXECUTABLE_PATH,
+                working_dir=SINGBOX_WORKING_DIR
+            )
+            self.singbox_version = self.singbox_core.get_version()
+
         self.router.add_api_route("/", self.base, methods=["POST"])
         self.router.add_api_route("/ping", self.ping, methods=["POST"])
         self.router.add_api_route("/connect", self.connect, methods=["POST"])
@@ -50,7 +69,13 @@ class Service(object):
         self.router.add_api_route("/stop", self.stop, methods=["POST"])
         self.router.add_api_route("/restart", self.restart, methods=["POST"])
 
+        # Sing-box routes
+        self.router.add_api_route("/singbox/start", self.singbox_start, methods=["POST"])
+        self.router.add_api_route("/singbox/stop", self.singbox_stop, methods=["POST"])
+        self.router.add_api_route("/singbox/restart", self.singbox_restart, methods=["POST"])
+
         self.router.add_websocket_route("/logs", self.logs)
+        self.router.add_websocket_route("/singbox/logs", self.singbox_logs)
 
     def match_session_id(self, session_id: UUID):
         if session_id != self.session_id:
@@ -61,12 +86,16 @@ class Service(object):
         return True
 
     def response(self, **kwargs):
-        return {
+        resp = {
             "connected": self.connected,
             "started": self.core.started,
             "core_version": self.core_version,
-            **kwargs
+            "singbox_enabled": SINGBOX_ENABLED,
         }
+        if SINGBOX_ENABLED and self.singbox_core:
+            resp["singbox_started"] = self.singbox_core.started
+            resp["singbox_version"] = self.singbox_version
+        return {**resp, **kwargs}
 
     def base(self):
         return self.response()
@@ -102,6 +131,12 @@ class Service(object):
         if self.core.started:
             try:
                 self.core.stop()
+            except RuntimeError:
+                pass
+
+        if SINGBOX_ENABLED and self.singbox_core and self.singbox_core.started:
+            try:
+                self.singbox_core.stop()
             except RuntimeError:
                 pass
 
@@ -237,6 +272,185 @@ class Service(object):
         cache = ''
         last_sent_ts = 0
         with self.core.get_logs() as logs:
+            while session_id == self.session_id:
+                if interval and time.time() - last_sent_ts >= interval and cache:
+                    try:
+                        await websocket.send_text(cache)
+                    except (WebSocketDisconnect, RuntimeError):
+                        break
+                    cache = ''
+                    last_sent_ts = time.time()
+
+                if not logs:
+                    try:
+                        await asyncio.wait_for(websocket.receive(), timeout=0.2)
+                        continue
+                    except asyncio.TimeoutError:
+                        continue
+                    except (WebSocketDisconnect, RuntimeError):
+                        break
+
+                log = logs.popleft()
+
+                if interval:
+                    cache += f'{log}\n'
+                    continue
+
+                try:
+                    await websocket.send_text(log)
+                except (WebSocketDisconnect, RuntimeError):
+                    break
+
+        await websocket.close()
+
+    # Sing-box methods
+    def singbox_start(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True)):
+        self.match_session_id(session_id)
+
+        if not SINGBOX_ENABLED:
+            raise HTTPException(
+                status_code=400,
+                detail="Sing-box is not enabled on this node"
+            )
+
+        try:
+            config = SingBoxConfig(config, self.client_ip)
+        except json.decoder.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "config": f'Failed to decode config: {exc}'
+                }
+            )
+
+        with self.singbox_core.get_logs() as logs:
+            try:
+                self.singbox_core.start(config)
+
+                start_time = time.time()
+                end_time = start_time + 3
+                last_log = ''
+                while time.time() < end_time:
+                    while logs:
+                        log = logs.popleft()
+                        if log:
+                            last_log = log
+                        if 'started' in log.lower():
+                            break
+                    time.sleep(0.1)
+
+            except Exception as exc:
+                logger.error(f"Failed to start sing-box: {exc}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=str(exc)
+                )
+
+        if not self.singbox_core.started:
+            raise HTTPException(
+                status_code=503,
+                detail=last_log
+            )
+
+        return self.response()
+
+    def singbox_stop(self, session_id: UUID = Body(embed=True)):
+        self.match_session_id(session_id)
+
+        if not SINGBOX_ENABLED:
+            raise HTTPException(
+                status_code=400,
+                detail="Sing-box is not enabled on this node"
+            )
+
+        try:
+            self.singbox_core.stop()
+
+        except RuntimeError:
+            pass
+
+        return self.response()
+
+    def singbox_restart(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True)):
+        self.match_session_id(session_id)
+
+        if not SINGBOX_ENABLED:
+            raise HTTPException(
+                status_code=400,
+                detail="Sing-box is not enabled on this node"
+            )
+
+        try:
+            config = SingBoxConfig(config, self.client_ip)
+        except json.decoder.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "config": f'Failed to decode config: {exc}'
+                }
+            )
+
+        try:
+            with self.singbox_core.get_logs() as logs:
+                self.singbox_core.restart(config)
+
+                start_time = time.time()
+                end_time = start_time + 3
+                last_log = ''
+                while time.time() < end_time:
+                    while logs:
+                        log = logs.popleft()
+                        if log:
+                            last_log = log
+                        if 'started' in log.lower():
+                            break
+                    time.sleep(0.1)
+
+        except Exception as exc:
+            logger.error(f"Failed to restart sing-box: {exc}")
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc)
+            )
+
+        if not self.singbox_core.started:
+            raise HTTPException(
+                status_code=503,
+                detail=last_log
+            )
+
+        return self.response()
+
+    async def singbox_logs(self, websocket: WebSocket):
+        if not SINGBOX_ENABLED or not self.singbox_core:
+            return await websocket.close(reason="Sing-box is not enabled.", code=4400)
+
+        session_id = websocket.query_params.get('session_id')
+        interval = websocket.query_params.get('interval')
+
+        try:
+            session_id = UUID(session_id)
+            if session_id != self.session_id:
+                return await websocket.close(reason="Session ID mismatch.", code=4403)
+
+        except ValueError:
+            return await websocket.close(reason="session_id should be a valid UUID.", code=4400)
+
+        if interval:
+            try:
+                interval = float(interval)
+
+            except ValueError:
+                return await websocket.close(reason="Invalid interval value.", code=4400)
+
+            if interval > 10:
+                return await websocket.close(reason="Interval must be more than 0 and at most 10 seconds.", code=4400)
+
+        await websocket.accept()
+
+        cache = ''
+        last_sent_ts = 0
+        with self.singbox_core.get_logs() as logs:
             while session_id == self.session_id:
                 if interval and time.time() - last_sent_ts >= interval and cache:
                     try:
