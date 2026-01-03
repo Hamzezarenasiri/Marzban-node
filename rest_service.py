@@ -90,9 +90,10 @@ class Service(object):
             "connected": self.connected,
             "started": self.core.started,
             "core_version": self.core_version,
-            "singbox_enabled": SINGBOX_ENABLED,
         }
+        # Only add sing-box fields when enabled to maintain compatibility with panel
         if SINGBOX_ENABLED and self.singbox_core:
+            resp["singbox_enabled"] = True
             resp["singbox_started"] = self.singbox_core.started
             resp["singbox_version"] = self.singbox_version
         return {**resp, **kwargs}
